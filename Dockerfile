@@ -1,5 +1,17 @@
+ARG CUDA_VERSION=11.8.0
+ARG OS_VERSION=22.04
+ARG USER_ID=1000
 # Define base image.
-FROM nvidia/cuda:11.8.0-devel-ubuntu22.04
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${OS_VERSION}
+ARG CUDA_VERSION
+ARG OS_VERSION
+ARG USER_ID
+
+# metainformation
+LABEL org.opencontainers.image.version = "0.1.18"
+LABEL org.opencontainers.image.source = "https://github.com/nerfstudio-project/nerfstudio"
+LABEL org.opencontainers.image.licenses = "Apache License 2.0"
+LABEL org.opencontainers.image.base.name="docker.io/library/nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${OS_VERSION}"
 
 # Variables used at build time.
 ## CUDA architectures, required by Colmap and tiny-cuda-nn.
@@ -28,6 +40,7 @@ RUN apt-get update && \
     libboost-program-options-dev \
     libboost-system-dev \
     libboost-test-dev \
+    libhdf5-dev \
     libcgal-dev \
     libeigen3-dev \
     libflann-dev \
@@ -42,10 +55,12 @@ RUN apt-get update && \
     libsuitesparse-dev \
     nano \
     protobuf-compiler \
+    python-is-python3 \
     python3.10-dev \
     python3-pip \
     qtbase5-dev \
     sudo \
+    vim-tiny \
     wget && \
     rm -rf /var/lib/apt/lists/*
 
@@ -56,7 +71,7 @@ RUN git clone --branch v0.6.0 https://github.com/google/glog.git --single-branch
     mkdir build && \
     cd build && \
     cmake .. && \
-    make -j && \
+    make -j `nproc` && \
     make install && \
     cd ../.. && \
     rm -rf glog
@@ -70,7 +85,7 @@ RUN git clone --branch 2.1.0 https://ceres-solver.googlesource.com/ceres-solver.
     mkdir build && \
     cd build && \
     cmake .. -DBUILD_TESTING=OFF -DBUILD_EXAMPLES=OFF && \
-    make -j && \
+    make -j `nproc` && \
     make install && \
     cd ../.. && \
     rm -rf ceres-solver
@@ -81,15 +96,14 @@ RUN git clone --branch 3.8 https://github.com/colmap/colmap.git --single-branch 
     mkdir build && \
     cd build && \
     cmake .. -DCUDA_ENABLED=ON \
-             -DCUDA_NVCC_FLAGS="--std c++14" \
              -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCHITECTURES} && \
-    make -j && \
+    make -j `nproc` && \
     make install && \
     cd ../.. && \
     rm -rf colmap
-    
+
 # Create non root user and setup environment.
-RUN useradd -m -d /home/user -g root -G sudo -u 1000 user
+RUN useradd -m -d /home/user -g root -G sudo -u ${USER_ID} user
 RUN usermod -aG sudo user
 # Set user password
 RUN echo "user:user" | chpasswd
@@ -97,7 +111,7 @@ RUN echo "user:user" | chpasswd
 RUN echo '%sudo ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers
 
 # Switch to new uer and workdir.
-USER 1000
+USER ${USER_ID}
 WORKDIR /home/user
 
 # Add local user binary folder to PATH variable.
@@ -105,39 +119,60 @@ ENV PATH="${PATH}:/home/user/.local/bin"
 SHELL ["/bin/bash", "-c"]
 
 # Upgrade pip and install packages.
-RUN python3.10 -m pip install --upgrade pip setuptools pathtools promise pybind11
-# Install pytorch and submodules (Currently, we still use cu116 which is the latest version for toch 1.12.1 and is compatible with CUDA 11.8).
-RUN python3.10 -m pip install torch==1.13.1+cu116 torchvision==0.14.1+cu116 --extra-index-url https://download.pytorch.org/whl/cu116
+RUN python3.10 -m pip install --no-cache-dir --upgrade pip setuptools pathtools promise pybind11
+# Install pytorch and submodules
+RUN CUDA_VER=${CUDA_VERSION%.*} && CUDA_VER=${CUDA_VER//./} && python3.10 -m pip install --no-cache-dir \
+    torch==2.0.1+cu${CUDA_VER} \
+    torchvision==0.15.2+cu${CUDA_VER} \
+        --extra-index-url https://download.pytorch.org/whl/cu${CUDA_VER}
 # Install tynyCUDNN (we need to set the target architectures as environment variable first).
 ENV TCNN_CUDA_ARCHITECTURES=${CUDA_ARCHITECTURES}
-RUN python3.10 -m pip install git+https://github.com/NVlabs/tiny-cuda-nn.git#subdirectory=bindings/torch
+RUN python3.10 -m pip install --no-cache-dir git+https://github.com/NVlabs/tiny-cuda-nn.git@v1.6#subdirectory=bindings/torch
 
-# Install pycolmap 0.3.0, required by hloc.
-RUN git clone --branch v0.3.0 --recursive https://github.com/colmap/pycolmap.git && \
+# Install pycolmap, required by hloc.
+RUN git clone --branch v0.4.0 --recursive https://github.com/colmap/pycolmap.git && \
     cd pycolmap && \
-    python3.10 -m pip install . && \
+    python3.10 -m pip install --no-cache-dir . && \
     cd ..
 
-# Install hloc master (last release (1.3) is too old) as alternative feature detector and matcher option for nerfstudio.
-RUN git clone --branch master --recursive https://github.com/cvg/Hierarchical-Localization && \
+# Install hloc 1.4 as alternative feature detector and matcher option for nerfstudio.
+RUN git clone --branch master --recursive https://github.com/cvg/Hierarchical-Localization.git && \
     cd Hierarchical-Localization && \
-    python3.10 -m pip install -e . && \
+    git checkout v1.4 && \
+    python3.10 -m pip install --no-cache-dir -e . && \
     cd ..
 
+# Install pyceres from source
+RUN git clone --branch v1.0 --recursive https://github.com/cvg/pyceres.git && \
+    cd pyceres && \
+    python3.10 -m pip install --no-cache-dir -e . && \
+    cd ..
+
+# Install pixel perfect sfm.
+RUN git clone --recursive https://github.com/cvg/pixel-perfect-sfm.git && \
+    cd pixel-perfect-sfm && \
+    git reset --hard 40f7c1339328b2a0c7cf71f76623fb848e0c0357 && \
+    git clean -df && \
+    python3.10 -m pip install --no-cache-dir -e . && \
+    cd ..
+
+RUN python3.10 -m pip install --no-cache-dir omegaconf
 # Copy nerfstudio folder and give ownership to user.
 ADD . /home/user/nerfstudio
 USER root
 RUN chown -R user /home/user/nerfstudio
-USER 1000
+USER ${USER_ID}
 
 # Install nerfstudio dependencies.
 RUN cd nerfstudio && \
-    python3.10 -m pip install -e . && \
+    python3.10 -m pip install --no-cache-dir -e . && \
     cd ..
 
 # Change working directory
 WORKDIR /workspace
 
-# Install nerfstudio cli auto completion and enter shell if no command was provided.
-CMD ns-install-cli --mode install && /bin/bash
+# Install nerfstudio cli auto completion
+RUN ns-install-cli --mode install
 
+# Bash as default entrypoint.
+CMD /bin/bash -l
